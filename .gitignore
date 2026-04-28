@@ -128,14 +128,73 @@ dmypy.json
 ehthumbs.db
 Thumbs.db
 
-# AI/ML specific
+# ==================== RAG-Wiki Phase 5: Comprehensive Entries ====================
+
+# Plan and deployment docs (update notes to repo README instead)
+prepdocs/plan.md
+DEPLOYMENT_GUIDE.md
+
+# Streamlit cache and settings
+.streamlit/
+streamlit_cache/
+*.streamlit.yml
+.streamlit_cache/
+
+# Ollama/LLM related models (large binary files - downloaded separately)
 models/
-data/
-*.pkl
-*.h5
-*.pb
+ollama/
+*.bin
+*.gguf
+*.model
+*.safetensors
+
+# Database and embeddings (large files - regenerated on first run)
+chroma_db/
+chroma.sqlite3
+*.sqlite3
+*.db
+
+# Logs and temporary files
 logs/
-checkpoints/
+*.log
+temp/
+*.tmp
+*.cache
+.cache
 
+# Environment and secrets
+.env.local
+.env.*.local
+secrets/
+config.local.yml
 
-plan.md
+# IDE specifics (enhanced)
+.vscode/extensions/
+.vscode/settings.json
+.vscode/launch.json
+.idea/workspace.xml
+.idea/caches/
+.idea/usages.xml
+*.iws
+*.iml
+
+# Additional OS files
+.DS_Store
+Thumbs.db
+.AppleDouble
+
+# Python optimization
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Project specific
+documents/*.pdf
+!documents/.gitkeep
+output/
+results/
+test_results/
+*.tmp.py
+
+prepdocs/
