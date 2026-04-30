@@ -1,4 +1,5 @@
-streamlit
+streamlit>=1.36,<2
+protobuf>=3.20,<6
 langchain
 langchain-community
 langchain-ollama
