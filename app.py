@@ -1,265 +1,132 @@
+"""
+RAG Wiki — Streamlit Chat Interface.
+
+Thin UI layer that delegates to rag_engine/ for all RAG logic.
+"""
+
 import streamlit as st
-from langchain_community.document_loaders import PyMuPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings, ChatOllama
-from langchain_chroma import Chroma
+import logging
 import os
+import shutil
 
-# ===================== CONFIG =====================
-st.set_page_config(page_title="RAG Wiki", page_icon="📚")
+from rag_engine.config import PDF_FOLDER, CHROMA_PATH, BM25_CACHE_PATH, LLM_MODEL
+from rag_engine.ingest import load_and_chunk_pdfs, build_vectorstore, load_vectorstore, load_bm25_cache
+from rag_engine.retriever import hybrid_retrieve
+from rag_engine.llm import generate_answer
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(name)s | %(levelname)s | %(message)s")
+
+# ===================== PAGE CONFIG =====================
+st.set_page_config(page_title="RAG Wiki", page_icon="📚", layout="wide")
 st.title("📚 RAG Wiki")
-st.caption("100% open-source • Runs on the laptop • CPU only")
+st.caption("100% open-source • Runs on the laptop • CPU only • Hybrid BM25 + Dense retrieval")
 
-PDF_FOLDER = "./documents"
-CHROMA_PATH = "./chroma_db"
-LLM_MODEL = "llama3.2:3b"          # change if you pulled another model
-EMBED_MODEL = "mxbai-embed-large"  # 1024 dims vs 384 (nomic), better for acronym disambiguation
-
-# ===================== INGESTION =====================
-
-def extract_context_from_pages(pages, page_index):
-    """Extract surrounding context for a page to disambiguate acronyms."""
-    context_window = 2  # Look 2 pages before and after
-    context_parts = []
-
-    start = max(0, page_index - context_window)
-    end = min(len(pages), page_index + context_window + 1)
-
-    for i in range(start, end):
-        if i != page_index and i < len(pages):
-            # Extract first 100 chars of surrounding pages for context
-            text = pages[i].page_content[:100] if pages[i].page_content else ""
-            if text:
-                context_parts.append(text.replace('\n', ' ')[:100])
-
-    return " | ".join(context_parts) if context_parts else ""
+# ===================== ENGINE INIT =====================
 
 @st.cache_resource
-def get_vectorstore():
-    embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url="http://localhost:11434")
+def init_engine():
+    """Initialize the RAG engine: load or build vectorstore + BM25 index."""
+    # Try loading existing vectorstore
+    vectorstore = load_vectorstore()
+    bm25_cache = load_bm25_cache()
 
-    if os.path.exists(CHROMA_PATH) and len(os.listdir(CHROMA_PATH)) > 0:
-        try:
-            return Chroma(
-                persist_directory=CHROMA_PATH,
-                embedding_function=embeddings,
-                collection_name="rag_wiki"
-            )
-        except Exception as e:
-            st.warning(f"Could not load existing database: {e}. Re-ingesting...")
-            import shutil
-            shutil.rmtree(CHROMA_PATH)
+    if vectorstore is not None and bm25_cache is not None:
+        return vectorstore, bm25_cache
 
-    st.info("First-time setup: Ingesting all PDFs... (this takes a few minutes)")
-    docs = []
+    # Need to build from scratch
+    status = st.empty()
+    def progress(msg):
+        status.info(f"⏳ {msg}")
 
-    for file in os.listdir(PDF_FOLDER):
-        if not file.lower().endswith(".pdf"):
-            continue
-        try:
-            pdf_path = os.path.join(PDF_FOLDER, file)
-            # Use absolute path to ensure PyMuPDFLoader works correctly
-            pdf_path = os.path.abspath(pdf_path)
-            loader = PyMuPDFLoader(pdf_path)
-            loaded_docs = loader.load()
-
-            # Phase 2: Enhanced chunk enrichment with metadata and context
-            for i, doc in enumerate(loaded_docs):
-                # Skip empty pages
-                if len(doc.page_content.strip()) == 0:
-                    continue
-
-                doc.metadata['filename'] = file
-                doc.metadata['source_page_index'] = i
-                # Page number already in metadata as 'page'
-
-            docs.extend([d for d in loaded_docs if len(d.page_content.strip()) > 0])
-        except Exception as e:
-            st.error(f"Error loading {file}: {e}")
-            continue
-
-    if not docs:
-        st.error("No documents loaded!")
-        return None
-
-    # Split into chunks - REDUCED size for mxbai-embed-large compatibility
-    # mxbai supports ~512 tokens, approximately 2000 chars but we use 300 to be safe
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,      # Reduced from 800 to ensure token compatibility
-        chunk_overlap=50,    # Reduced overlap to match smaller chunks
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
-    chunks = text_splitter.split_documents(docs)
-
-    if not chunks:
-        st.error("No chunks created from documents!")
-        return None
-
-    # Phase 2 continued: Add global chunk sequence and context metadata
-    for i, chunk in enumerate(chunks):
-        chunk.metadata['global_chunk_id'] = i
-        # Extract section context (first 50 chars of chunk as mini-context)
-        chunk.metadata['chunk_context'] = chunk.page_content[:50].replace('\n', ' ')
-
-    # Create vector store with mxbai-embed-large
     try:
-        vectorstore = Chroma.from_documents(
-            documents=chunks,
-            embedding=embeddings,
-            persist_directory=CHROMA_PATH,
-            collection_name="rag_wiki"
-        )
-        st.success(f"✅ Ingested {len(chunks)} chunks from {len(os.listdir(PDF_FOLDER))} PDFs")
-        return vectorstore
+        chunks = load_and_chunk_pdfs(progress_callback=progress)
+        vectorstore = build_vectorstore(chunks, progress_callback=progress)
+        bm25_cache = load_bm25_cache()
+        status.success(f"✅ Ingested {len(chunks)} chunks. Ready to chat!")
+        return vectorstore, bm25_cache
     except Exception as e:
-        st.error(f"Error creating vector store: {e}")
-        raise
+        status.error(f"❌ Ingestion failed: {e}")
+        st.stop()
 
-# ===================== UI =====================
-vectorstore = get_vectorstore()
+vectorstore, bm25_cache = init_engine()
 
-# Two-stage retrieval with enhanced reranking
-def retrieve_and_rerank(query, k=8, fetch_k=25):
-    """
-    Phase 3: Two-stage retrieval with reranking
-    Stage 1: Dense retrieval using mxbai-embed-large (better semantic understanding)
-    Stage 2: Reranking by semantic similarity, keyword overlap, and document diversity
-    """
-    # Stage 1: Dense retrieval
-    candidates = vectorstore.similarity_search_with_relevance_scores(query, k=fetch_k)
-
-    # Stage 2: Reranking with multiple scoring factors
-    reranked = []
-    doc_counts = {}
-    query_terms = set(query.lower().split())
-
-    for doc, semantic_score in candidates:
-        filename = doc.metadata.get('filename', 'unknown')
-
-        # Track document frequency
-        doc_counts[filename] = doc_counts.get(filename, 0) + 1
-
-        # Diversity penalty: penalize multiple chunks from same document
-        # This ensures we get chunks from different documents for acronym disambiguation
-        diversity_penalty = (doc_counts[filename] - 1) * 0.15
-
-        # Keyword overlap: how many query terms appear in the chunk
-        chunk_terms = set(doc.page_content.lower().split())
-        keyword_overlap = len(query_terms & chunk_terms) / max(len(query_terms), 1) if query_terms else 0
-
-        # Exact phrase matching bonus
-        exact_match_bonus = 0.1 if any(phrase in doc.page_content.lower() for phrase in query.lower().split()) else 0
-
-        # Calculate final score
-        final_score = semantic_score + (keyword_overlap * 0.2) + exact_match_bonus - diversity_penalty
-
-        reranked.append((doc, final_score))
-
-    # Sort by final score descending
-    reranked.sort(key=lambda x: x[1], reverse=True)
-    return [doc for doc, _ in reranked[:k]]
-
-retriever_func = lambda query: retrieve_and_rerank(query)
-
-llm = ChatOllama(model=LLM_MODEL, temperature=0)
-
-# Sidebar controls
+# ===================== SIDEBAR =====================
 with st.sidebar:
-    st.subheader("📁 Documents Folder")
-    st.write(f"`{PDF_FOLDER}`")
-    if st.button("🔄 Re-ingest All PDFs"):
+    st.subheader("⚙️ Settings")
+
+    # Model selector
+    llm_model = st.selectbox(
+        "LLM Model",
+        ["llama3.2:3b", "qwen2.5:7b"],
+        index=0,
+        help="3b is faster, 7b gives better answers"
+    )
+
+    st.divider()
+    st.subheader("📁 Documents")
+    # List PDFs
+    pdf_files = [f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
+    for pdf in sorted(pdf_files):
+        st.caption(f"• {pdf}")
+    st.caption(f"Total: {len(pdf_files)} PDFs")
+
+    st.divider()
+    if st.button("🔄 Re-ingest All PDFs", use_container_width=True):
+        # Clear everything
         if os.path.exists(CHROMA_PATH):
-            import shutil
             shutil.rmtree(CHROMA_PATH)
+        if os.path.exists(BM25_CACHE_PATH):
+            os.remove(BM25_CACHE_PATH)
         st.cache_resource.clear()
         st.rerun()
 
-# Main chat
+# ===================== CHAT =====================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+# Handle new input
 if prompt := st.chat_input("Ask anything about your PDFs..."):
+    # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Retrieve + generate
+    # Generate response
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            # Get relevant chunks
-            docs = retrieve_and_rerank(prompt)
+        with st.spinner("Searching documents and generating answer..."):
+            # Retrieve
+            docs = hybrid_retrieve(
+                query=prompt,
+                vectorstore=vectorstore,
+                bm25_cache=bm25_cache,
+            )
 
-            # Phase 4: Intelligent context assembly - Group by document
-            context_by_doc = {}
-            doc_relevance_order = []  # Track order for source display
+            # Generate
+            answer, sources = generate_answer(
+                query=prompt,
+                docs=docs,
+                model=llm_model,
+            )
 
-            for doc in docs:
-                filename = doc.metadata.get('filename', 'unknown')
-                if filename not in context_by_doc:
-                    context_by_doc[filename] = []
-                    doc_relevance_order.append(filename)
-                context_by_doc[filename].append(doc)
-
-            # Build context with clear document boundaries and page numbers
-            context_parts = []
-            for filename in doc_relevance_order:
-                doc_list = context_by_doc[filename]
-                context_parts.append(f"\n## Source Document: {filename}")
-                context_parts.append("-" * 60)
-
-                for idx, doc in enumerate(doc_list, 1):
-                    page = doc.metadata.get('page', 0) + 1
-                    context_parts.append(f"\n[Page {page}]")
-                    context_parts.append(doc.page_content.strip())
-
-                context_parts.append("")  # Blank line between documents
-
-            context = "\n".join(context_parts)
-
-            # Phase 4: Enhanced system prompt - Generic, handles any ambiguity
-            system_prompt = """You are a helpful assistant answering questions based ONLY on the provided context from multiple documents.
-
-IMPORTANT GUIDELINES:
-1. Answer ONLY using information from the provided context
-2. If a term (especially acronyms or technical terms) has multiple meanings across different documents, clearly explain ALL meanings found
-3. Always cite the specific document source for each meaning (e.g., "In [Document Name]...")
-4. When different documents define the same term differently, present both/all definitions clearly
-5. List all source documents used at the end with exact page numbers
-6. Do NOT make up or assume information not in the context
-7. If the context doesn't contain information to answer the question, say so explicitly
-
-Format for multiple meanings:
-- Term/Acronym: [TERM]
-  - Meaning 1: [From Document A, Page X]: [Definition]
-  - Meaning 2: [From Document B, Page Y]: [Definition]
-  - etc.
-
-Always be thorough when dealing with acronyms or potentially ambiguous terms."""
-
-            messages = [
-                ("system", system_prompt),
-                ("human", f"Context from documents:\n{context}\n\nQuestion: {prompt}")
-            ]
-            
-            response = llm.invoke(messages)
-            answer = response.content
-            
+            # Display answer
             st.markdown(answer)
-            
-            # Show sources in order of relevance
-            st.divider()
-            st.caption("**📄 Sources Used:**")
-            for doc in docs:
-                source = doc.metadata.get("filename", "unknown")
-                page = doc.metadata.get("page", "?")
-                if isinstance(page, int):
-                    page = page + 1
-                else:
-                    page = int(page) + 1 if isinstance(page, str) and page.isdigit() else "?"
-                st.caption(f"• {source} — Page {page}")
+
+            # Display sources
+            if sources:
+                st.divider()
+                st.caption("**📄 Sources Used:**")
+                # Deduplicate sources
+                seen = set()
+                for src in sources:
+                    key = f"{src['filename']}:p{src['page']}"
+                    if key not in seen:
+                        seen.add(key)
+                        st.caption(f"• {src['filename']} — Page {src['page']}")
 
     st.session_state.messages.append({"role": "assistant", "content": answer})

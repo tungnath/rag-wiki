@@ -8,3 +8,5 @@ langchain-text-splitters
 chromadb
 pypdf
 pymupdf
+rank_bm25
+numpy
