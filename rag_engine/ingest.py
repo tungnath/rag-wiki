@@ -191,7 +191,19 @@ def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
             # This ensures the EMBEDDING ITSELF knows which document
             # the chunk came from, making dense retrieval document-aware.
             original_content = chunk.page_content.strip()
-            chunk.page_content = f"[Source: {filename} | Topic: {doc_title}]\n{original_content}"
+            prefix = f"[Source: {filename} | Topic: {doc_title}]\n"
+            enriched_content = prefix + original_content
+
+            # Hard cap at MAX_EMBED_CHARS to stay within embedding
+            # model's token limit (mxbai-embed-large: 512 tokens).
+            MAX_EMBED_CHARS = 1500  # ~375 tokens, safe margin
+            if len(enriched_content) > MAX_EMBED_CHARS:
+                # Truncate original content, keep prefix intact
+                allowed = MAX_EMBED_CHARS - len(prefix)
+                original_content = original_content[:allowed]
+                enriched_content = prefix + original_content
+
+            chunk.page_content = enriched_content
 
             # Rich metadata
             chunk.metadata["filename"] = filename
@@ -227,38 +239,63 @@ def build_vectorstore(chunks: list[Document], progress_callback=None) -> Chroma:
     # Delete old DB if it exists
     if os.path.exists(CHROMA_PATH):
         log("Removing old vector database...")
-        shutil.rmtree(CHROMA_PATH)
+        import gc
+        gc.collect()  # Release any Python references to SQLite
+        import time as _time
+        for attempt in range(3):
+            try:
+                shutil.rmtree(CHROMA_PATH)
+                break
+            except PermissionError:
+                if attempt < 2:
+                    _time.sleep(1)
+                else:
+                    # Last resort: rename instead of delete
+                    backup = CHROMA_PATH + f"_old_{int(_time.time())}"
+                    os.rename(CHROMA_PATH, backup)
+                    log(f"Could not delete old DB, renamed to {backup}")
 
     log(f"Building vector store with {len(chunks)} chunks...")
     log(f"Embedding model: {EMBED_MODEL} (this may take a few minutes on CPU)")
 
-    # Batch embedding to avoid exceeding Ollama context limits.
-    # Ollama's embed endpoint can fail when too many texts are sent
-    # at once (combined length exceeds model context window).
-    BATCH_SIZE = 5  # Small batches — safe for any chunk size
+    # Embed ONE chunk at a time to avoid Ollama context-length errors.
+    # mxbai-embed-large has a 512-token limit; even with our 1500-char
+    # cap, batching multiple chunks can still exceed it.
     vectorstore = None
+    failed_chunks = 0
 
-    for batch_start in range(0, len(chunks), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(chunks))
-        batch = chunks[batch_start:batch_end]
-        batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+    for i, chunk in enumerate(chunks):
+        if (i + 1) % 20 == 0 or i == 0:
+            log(f"Embedding chunk {i + 1}/{len(chunks)}...")
 
-        log(f"Embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+        try:
+            if vectorstore is None:
+                vectorstore = Chroma.from_documents(
+                    documents=[chunk],
+                    embedding=embeddings,
+                    persist_directory=CHROMA_PATH,
+                    collection_name=CHROMA_COLLECTION,
+                )
+            else:
+                vectorstore.add_documents([chunk])
+        except Exception as e:
+            # If a chunk fails, try truncating it further and retry
+            error_msg = str(e)
+            if "context length" in error_msg or "input length" in error_msg:
+                logger.warning(f"Chunk {i} too long ({len(chunk.page_content)} chars), truncating...")
+                chunk.page_content = chunk.page_content[:800]
+                try:
+                    vectorstore.add_documents([chunk])
+                except Exception:
+                    logger.error(f"Chunk {i} still too long after truncation, skipping.")
+                    failed_chunks += 1
+            else:
+                logger.error(f"Chunk {i} embedding failed: {e}")
+                failed_chunks += 1
 
-        if vectorstore is None:
-            # First batch — create the vectorstore
-            vectorstore = Chroma.from_documents(
-                documents=batch,
-                embedding=embeddings,
-                persist_directory=CHROMA_PATH,
-                collection_name=CHROMA_COLLECTION,
-            )
-        else:
-            # Subsequent batches — add to existing vectorstore
-            vectorstore.add_documents(batch)
-
-    log(f"Vector store built successfully ({len(chunks)} chunks)")
+    if failed_chunks:
+        log(f"WARNING: {failed_chunks} chunks failed to embed")
+    log(f"Vector store built ({len(chunks) - failed_chunks}/{len(chunks)} chunks embedded)")
 
     # ── Build and cache BM25 index ──
     log("Building BM25 index...")
