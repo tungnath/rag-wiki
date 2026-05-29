@@ -1,13 +1,17 @@
 """
-PDF ingestion pipeline.
+Document ingestion pipeline.
+
+Supports: PDF, TXT, MD, CSV, DOCX
 
 Key design decisions:
-1. Chunk size 800 chars (was 300) — gives embeddings enough context to capture topic.
+1. Chunk size 500 chars — gives embeddings enough context to capture topic.
 2. Document title is prepended to every chunk's page_content BEFORE embedding —
    so the embedding itself encodes which document a chunk came from.
 3. Image-based PDFs (like infographics) get OCR fallback via PyMuPDF's built-in OCR
    or are skipped with a warning.
 4. Rich metadata: filename, page number, chunk index, document title.
+5. Non-PDF text files (txt, md, csv) are loaded directly as single-page documents.
+6. DOCX files are loaded via python-docx if available, otherwise skipped.
 """
 
 import os
@@ -23,10 +27,10 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from .config import (
-    PDF_FOLDER, CHROMA_PATH, BM25_CACHE_PATH,
+    DOCUMENTS_FOLDER, PDF_FOLDER, CHROMA_PATH, BM25_CACHE_PATH,
     OLLAMA_BASE_URL, EMBED_MODEL,
     CHUNK_SIZE, CHUNK_OVERLAP, CHUNK_SEPARATORS,
-    CHROMA_COLLECTION,
+    CHROMA_COLLECTION, SUPPORTED_EXTENSIONS,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,16 +94,12 @@ def _load_single_pdf(filepath: str, filename: str) -> list[Document]:
             ocr_pages = []
             for page_num in range(len(doc)):
                 page = doc[page_num]
-                # Try to get text from the page's text dict (handles some embedded text)
                 text = page.get_text("text")
                 if not text.strip():
-                    # Try extracting text from image blocks via OCR
-                    # PyMuPDF can extract text from images if Tesseract is available
                     try:
                         tp = page.get_textpage_ocr(flags=fitz.TEXT_PRESERVE_WHITESPACE)
                         text = page.get_text("text", textpage=tp)
                     except Exception:
-                        # OCR not available, extract what we can from HTML
                         text = ""
 
                 if text.strip():
@@ -130,8 +130,111 @@ def _load_single_pdf(filepath: str, filename: str) -> list[Document]:
     return non_empty
 
 
-def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
-    """Load all PDFs from the documents folder, split into chunks with enriched metadata.
+def _load_single_text_file(filepath: str, filename: str) -> list[Document]:
+    """Load a plain text file (.txt, .md, .csv) as one or more Document pages.
+    
+    Large files are split into ~10KB logical pages to keep memory
+    manageable and give meaningful page numbers in metadata.
+    """
+    PAGE_SIZE = 10_000  # chars per logical page
+    try:
+        # Try UTF-8 first, fall back to latin-1
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                with open(filepath, "r", encoding=encoding) as f:
+                    full_text = f.read()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            logger.error(f"{filename}: Could not decode with any known encoding.")
+            return []
+
+        if not full_text.strip():
+            logger.warning(f"{filename}: File is empty. Skipping.")
+            return []
+
+        # Split into logical pages for large files
+        pages = []
+        for page_num, start in enumerate(range(0, len(full_text), PAGE_SIZE)):
+            page_text = full_text[start:start + PAGE_SIZE].strip()
+            if page_text:
+                pages.append(Document(
+                    page_content=page_text,
+                    metadata={
+                        "source": filepath,
+                        "page": page_num,
+                        "filename": filename,
+                    }
+                ))
+
+        return pages
+
+    except Exception as e:
+        logger.error(f"Failed to load {filename}: {e}")
+        return []
+
+
+def _load_single_docx(filepath: str, filename: str) -> list[Document]:
+    """Load a .docx file using python-docx. Returns one Document per page-ish section."""
+    try:
+        from docx import Document as DocxDocument
+    except ImportError:
+        logger.warning(
+            f"{filename}: python-docx not installed. "
+            f"Run 'pip install python-docx' to enable DOCX support. Skipping."
+        )
+        return []
+
+    try:
+        doc = DocxDocument(filepath)
+        full_text = "\n".join(para.text for para in doc.paragraphs if para.text.strip())
+
+        if not full_text.strip():
+            logger.warning(f"{filename}: No text content in DOCX. Skipping.")
+            return []
+
+        # Treat entire DOCX as one logical page (most DOCX files aren't huge)
+        # Split into ~10KB pages for very large docs
+        PAGE_SIZE = 10_000
+        pages = []
+        for page_num, start in enumerate(range(0, len(full_text), PAGE_SIZE)):
+            page_text = full_text[start:start + PAGE_SIZE].strip()
+            if page_text:
+                pages.append(Document(
+                    page_content=page_text,
+                    metadata={
+                        "source": filepath,
+                        "page": page_num,
+                        "filename": filename,
+                    }
+                ))
+        return pages
+
+    except Exception as e:
+        logger.error(f"Failed to load {filename}: {e}")
+        return []
+
+
+def _load_document(filepath: str, filename: str) -> list[Document]:
+    """Route a file to the appropriate loader based on its extension."""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext == ".pdf":
+        return _load_single_pdf(filepath, filename)
+    elif ext in (".txt", ".md", ".csv"):
+        return _load_single_text_file(filepath, filename)
+    elif ext == ".docx":
+        return _load_single_docx(filepath, filename)
+    else:
+        logger.warning(f"{filename}: Unsupported file type '{ext}'. Skipping.")
+        return []
+
+
+def load_and_chunk_documents(progress_callback=None) -> list[Document]:
+    """Load all supported documents from the documents folder, split into chunks.
+    
+    Supported formats: PDF, TXT, MD, CSV, DOCX
     
     Args:
         progress_callback: Optional callable(message: str) for progress updates.
@@ -144,29 +247,42 @@ def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
         if progress_callback:
             progress_callback(msg)
 
-    if not os.path.exists(PDF_FOLDER):
-        raise FileNotFoundError(f"PDF folder not found: {PDF_FOLDER}")
+    if not os.path.exists(DOCUMENTS_FOLDER):
+        raise FileNotFoundError(f"Documents folder not found: {DOCUMENTS_FOLDER}")
 
-    pdf_files = [f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
-    if not pdf_files:
-        raise FileNotFoundError(f"No PDF files found in {PDF_FOLDER}")
+    # Discover all supported files
+    all_files = [
+        f for f in os.listdir(DOCUMENTS_FOLDER)
+        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+    ]
+    if not all_files:
+        raise FileNotFoundError(
+            f"No supported files found in {DOCUMENTS_FOLDER}. "
+            f"Supported types: {', '.join(SUPPORTED_EXTENSIONS)}"
+        )
 
-    log(f"Found {len(pdf_files)} PDF files")
+    # Group by type for logging
+    by_ext = {}
+    for f in all_files:
+        ext = os.path.splitext(f)[1].lower()
+        by_ext.setdefault(ext, []).append(f)
+    type_summary = ", ".join(f"{len(v)} {k}" for k, v in sorted(by_ext.items()))
+    log(f"Found {len(all_files)} documents ({type_summary})")
 
-    # ── Phase 1: Load all PDFs ──
+    # ── Phase 1: Load all documents ──
     all_pages = []
-    for filename in sorted(pdf_files):
-        filepath = os.path.abspath(os.path.join(PDF_FOLDER, filename))
+    for filename in sorted(all_files):
+        filepath = os.path.abspath(os.path.join(DOCUMENTS_FOLDER, filename))
         log(f"Loading: {filename}")
-        pages = _load_single_pdf(filepath, filename)
+        pages = _load_document(filepath, filename)
         if pages:
-            log(f"  → {len(pages)} pages loaded")
+            log(f"  -> {len(pages)} pages loaded")
             all_pages.extend(pages)
         else:
-            log(f"  → WARNING: No content extracted from {filename}")
+            log(f"  -> WARNING: No content extracted from {filename}")
 
     if not all_pages:
-        raise ValueError("No content extracted from any PDF!")
+        raise ValueError("No content extracted from any document!")
 
     log(f"Total pages loaded: {len(all_pages)}")
 
@@ -188,17 +304,14 @@ def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
 
         for chunk_idx, chunk in enumerate(page_chunks):
             # ── KEY: Prepend document title to chunk content ──
-            # This ensures the EMBEDDING ITSELF knows which document
-            # the chunk came from, making dense retrieval document-aware.
             original_content = chunk.page_content.strip()
             prefix = f"[Source: {filename} | Topic: {doc_title}]\n"
             enriched_content = prefix + original_content
 
             # Hard cap at MAX_EMBED_CHARS to stay within embedding
             # model's token limit (mxbai-embed-large: 512 tokens).
-            MAX_EMBED_CHARS = 1500  # ~375 tokens, safe margin
+            MAX_EMBED_CHARS = 1500
             if len(enriched_content) > MAX_EMBED_CHARS:
-                # Truncate original content, keep prefix intact
                 allowed = MAX_EMBED_CHARS - len(prefix)
                 original_content = original_content[:allowed]
                 enriched_content = prefix + original_content
@@ -210,14 +323,18 @@ def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
             chunk.metadata["doc_title"] = doc_title
             chunk.metadata["page"] = page_num
             chunk.metadata["chunk_index"] = chunk_idx
-            # Store original content without prefix for BM25 (avoids
-            # BM25 over-weighting the prefix terms)
             chunk.metadata["original_content"] = original_content
 
             enriched_chunks.append(chunk)
 
-    log(f"Created {len(enriched_chunks)} chunks from {len(pdf_files)} PDFs")
+    log(f"Created {len(enriched_chunks)} chunks from {len(all_files)} documents")
     return enriched_chunks
+
+
+# Backward compatibility alias
+def load_and_chunk_pdfs(progress_callback=None) -> list[Document]:
+    """Deprecated: Use load_and_chunk_documents() instead."""
+    return load_and_chunk_documents(progress_callback=progress_callback)
 
 
 def build_vectorstore(chunks: list[Document], progress_callback=None) -> Chroma:
@@ -258,40 +375,55 @@ def build_vectorstore(chunks: list[Document], progress_callback=None) -> Chroma:
     log(f"Building vector store with {len(chunks)} chunks...")
     log(f"Embedding model: {EMBED_MODEL} (this may take a few minutes on CPU)")
 
-    # Embed ONE chunk at a time to avoid Ollama context-length errors.
-    # mxbai-embed-large has a 512-token limit; even with our 1500-char
-    # cap, batching multiple chunks can still exceed it.
+    # Batch embedding with per-batch error recovery.
+    # Uses batches of 10 for speed; if a batch fails (context length),
+    # falls back to embedding that batch's chunks one-at-a-time.
+    BATCH_SIZE = 10
     vectorstore = None
     failed_chunks = 0
 
-    for i, chunk in enumerate(chunks):
-        if (i + 1) % 20 == 0 or i == 0:
-            log(f"Embedding chunk {i + 1}/{len(chunks)}...")
+    for batch_start in range(0, len(chunks), BATCH_SIZE):
+        batch = chunks[batch_start:batch_start + BATCH_SIZE]
+        batch_num = batch_start // BATCH_SIZE + 1
+        total_batches = (len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE
+
+        if batch_num % 10 == 1 or batch_num == total_batches:
+            log(f"Embedding batch {batch_num}/{total_batches} (chunk {batch_start+1}-{batch_start+len(batch)}/{len(chunks)})...")
 
         try:
             if vectorstore is None:
                 vectorstore = Chroma.from_documents(
-                    documents=[chunk],
+                    documents=batch,
                     embedding=embeddings,
                     persist_directory=CHROMA_PATH,
                     collection_name=CHROMA_COLLECTION,
                 )
             else:
-                vectorstore.add_documents([chunk])
+                vectorstore.add_documents(batch)
         except Exception as e:
-            # If a chunk fails, try truncating it further and retry
+            # Batch failed — fall back to per-chunk embedding
             error_msg = str(e)
-            if "context length" in error_msg or "input length" in error_msg:
-                logger.warning(f"Chunk {i} too long ({len(chunk.page_content)} chars), truncating...")
-                chunk.page_content = chunk.page_content[:800]
+            logger.warning(f"Batch {batch_num} failed ({error_msg[:80]}), retrying chunks individually...")
+            for j, chunk in enumerate(batch):
+                chunk_idx = batch_start + j
                 try:
-                    vectorstore.add_documents([chunk])
+                    if vectorstore is None:
+                        vectorstore = Chroma.from_documents(
+                            documents=[chunk],
+                            embedding=embeddings,
+                            persist_directory=CHROMA_PATH,
+                            collection_name=CHROMA_COLLECTION,
+                        )
+                    else:
+                        vectorstore.add_documents([chunk])
                 except Exception:
-                    logger.error(f"Chunk {i} still too long after truncation, skipping.")
-                    failed_chunks += 1
-            else:
-                logger.error(f"Chunk {i} embedding failed: {e}")
-                failed_chunks += 1
+                    # Try truncation as last resort
+                    try:
+                        chunk.page_content = chunk.page_content[:800]
+                        vectorstore.add_documents([chunk])
+                    except Exception:
+                        logger.error(f"Chunk {chunk_idx} skipped (could not embed)")
+                        failed_chunks += 1
 
     if failed_chunks:
         log(f"WARNING: {failed_chunks} chunks failed to embed")

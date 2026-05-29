@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rag_engine.config import FINAL_K
 from rag_engine.ingest import (
-    load_and_chunk_pdfs, build_vectorstore,
+    load_and_chunk_documents, build_vectorstore,
     load_vectorstore, load_bm25_cache
 )
 from rag_engine.retriever import hybrid_retrieve
@@ -50,6 +50,7 @@ MCP_INTRO = "Intro_to_MCP.pdf"
 MCP_GUIDE = "mcp guide.pdf"
 LINUX = "linux-commands.pdf"
 SQL = "SQL_Window_Functions_1_1.pdf"
+SHAKESPEARE = "tinyshakespeare.txt"
 
 # Any MCP document is acceptable for general MCP queries
 MCP_ANY = [MCP_INTRO, MCP_GUIDE]
@@ -180,15 +181,29 @@ TEST_CASES = [
     ("6.03", "What is the ./ notation?", [LINUX], 4),
     ("6.04", "How to colorize ls output?", [LINUX], 4),
     ("6.05", "What is Chainlit?", [MCP_GUIDE], 4),
+
+    # ----------------------------------------------------------
+    # Category 7: Shakespeare / TXT file tests (10 tests)
+    # ----------------------------------------------------------
+    ("7.01", "Who is Caius Marcius?", [SHAKESPEARE], 4),
+    ("7.02", "What did Menenius say to the citizens?", [SHAKESPEARE], 4),
+    ("7.03", "Who is Aufidius?", [SHAKESPEARE], 4),
+    ("7.04", "What are the Volsces?", [SHAKESPEARE], 4),
+    ("7.05", "Who is Volumnia?", [SHAKESPEARE], 4),
+    ("7.06", "What is the belly fable in Coriolanus?", [SHAKESPEARE], 4),
+    ("7.07", "Who are the tribunes in Shakespeare?", [SHAKESPEARE], 4),
+    ("7.08", "What did Romeo say about Juliet?", [SHAKESPEARE], 4),
+    ("7.09", "Who is King Henry in Shakespeare?", [SHAKESPEARE], 4),
+    ("7.10", "What is Hamlet's soliloquy about?", [SHAKESPEARE], 4),
 ]
 
-assert len(TEST_CASES) == 100, f"Expected 100 test cases, got {len(TEST_CASES)}"
+assert len(TEST_CASES) == 110, f"Expected 110 test cases, got {len(TEST_CASES)}"
 
 
 def run_tests():
-    """Run all 100 retrieval test cases."""
+    """Run all 110 retrieval test cases."""
     print("=" * 80)
-    print("RAG Wiki -- Retrieval Test Suite (100 tests)")
+    print("RAG Wiki -- Retrieval Test Suite (110 tests)")
     print("=" * 80)
 
     # -- Initialize engine --
@@ -198,7 +213,7 @@ def run_tests():
 
     if vectorstore is None or bm25_cache is None:
         print("  -> Vectorstore or BM25 not found. Building from scratch...")
-        chunks = load_and_chunk_pdfs(progress_callback=lambda m: print(f"  -> {m}"))
+        chunks = load_and_chunk_documents(progress_callback=lambda m: print(f"  -> {m}"))
         vectorstore = build_vectorstore(chunks, progress_callback=lambda m: print(f"  -> {m}"))
         bm25_cache = load_bm25_cache()
         print(f"  -> Built vectorstore with {len(chunks)} chunks")

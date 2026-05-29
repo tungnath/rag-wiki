@@ -3,7 +3,9 @@
 import os
 
 # ─── Paths ───────────────────────────────────────────────────────────
-PDF_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "documents")
+DOCUMENTS_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "documents")
+# Backward compat alias
+PDF_FOLDER = DOCUMENTS_FOLDER
 CHROMA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "chroma_db")
 BM25_CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bm25_cache.pkl")
 
@@ -16,6 +18,9 @@ LLM_MODEL = "llama3.2:3b"           # Fastest CPU option
 CHUNK_SIZE = 500            # Chars — with ~60 char prefix, stays within mxbai 512-token window
 CHUNK_OVERLAP = 100         # 20% overlap preserves sentence boundaries
 CHUNK_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
+
+# ─── Supported file types ────────────────────────────────────────────
+SUPPORTED_EXTENSIONS = (".pdf", ".txt", ".md", ".csv", ".docx")
 
 # ─── Retrieval ───────────────────────────────────────────────────────
 DENSE_K = 15                # Candidates from dense (semantic) search

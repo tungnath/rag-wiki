@@ -9,8 +9,8 @@ import logging
 import os
 import shutil
 
-from rag_engine.config import PDF_FOLDER, CHROMA_PATH, BM25_CACHE_PATH, LLM_MODEL
-from rag_engine.ingest import load_and_chunk_pdfs, build_vectorstore, load_vectorstore, load_bm25_cache
+from rag_engine.config import DOCUMENTS_FOLDER, CHROMA_PATH, BM25_CACHE_PATH, LLM_MODEL, SUPPORTED_EXTENSIONS
+from rag_engine.ingest import load_and_chunk_documents, build_vectorstore, load_vectorstore, load_bm25_cache
 from rag_engine.retriever import hybrid_retrieve
 from rag_engine.llm import generate_answer
 
@@ -40,7 +40,7 @@ def init_engine():
         status.info(f"⏳ {msg}")
 
     try:
-        chunks = load_and_chunk_pdfs(progress_callback=progress)
+        chunks = load_and_chunk_documents(progress_callback=progress)
         vectorstore = build_vectorstore(chunks, progress_callback=progress)
         bm25_cache = load_bm25_cache()
         status.success(f"✅ Ingested {len(chunks)} chunks. Ready to chat!")
@@ -65,14 +65,20 @@ with st.sidebar:
 
     st.divider()
     st.subheader("📁 Documents")
-    # List PDFs
-    pdf_files = [f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
-    for pdf in sorted(pdf_files):
-        st.caption(f"• {pdf}")
-    st.caption(f"Total: {len(pdf_files)} PDFs")
+    # List all supported documents
+    doc_files = [
+        f for f in os.listdir(DOCUMENTS_FOLDER)
+        if os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+    ]
+    for doc in sorted(doc_files):
+        ext = os.path.splitext(doc)[1].lower()
+        icon = {"pdf": "📕", ".txt": "📄", ".md": "📝", ".csv": "📊", ".docx": "📘"}.get(ext, "📄")
+        st.caption(f"{icon} {doc}")
+    st.caption(f"Total: {len(doc_files)} documents")
+    st.caption(f"Supported: {', '.join(SUPPORTED_EXTENSIONS)}")
 
     st.divider()
-    if st.button("🔄 Re-ingest All PDFs", use_container_width=True):
+    if st.button("🔄 Re-ingest All Documents", use_container_width=True):
         # Clear everything
         if os.path.exists(CHROMA_PATH):
             shutil.rmtree(CHROMA_PATH)
@@ -91,7 +97,7 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
 
 # Handle new input
-if prompt := st.chat_input("Ask anything about your PDFs..."):
+if prompt := st.chat_input("Ask anything about your documents..."):
     # Add user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
